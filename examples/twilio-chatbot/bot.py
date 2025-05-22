@@ -18,8 +18,11 @@ from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
+from pipecat.audio.filters.krisp_filter import KrispFilter
 from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+from pipecat.pipeline.parallel_pipeline import ParallelPipeline
+from pipecat.processors.filters.function_filter import FunctionFilter
+from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext, OpenAILLMContextFrame
 from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
 from pipecat.serializers.twilio import TwilioFrameSerializer
 from pipecat.services.deepgram.stt import DeepgramSTTService
@@ -29,6 +32,21 @@ from pipecat.transports.network.fastapi_websocket import (
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
 )
+from pipecat.services.google.llm import GoogleLLMService
+from smart_endpointing import CLASSIFIER_MODEL, classifier_system_instruction, StatementJudgeContextFilter, CompletenessCheck, OutputGate, AudioAccumulator
+from pipecat.sync.event_notifier import EventNotifier
+from pipecat.frames.frames import (
+    UserStoppedSpeakingFrame,
+    LLMMessagesFrame,
+    StartInterruptionFrame,
+    StopInterruptionFrame,
+    FunctionCallInProgressFrame,
+    FunctionCallResultFrame,
+    Frame
+    
+)
+from pipecat.processors.user_idle_processor import UserIdleProcessor
+
 
 load_dotenv(override=True)
 
@@ -70,23 +88,20 @@ async def run_bot(websocket_client: WebSocket, stream_sid: str, call_sid: str, t
             add_wav_header=False,
             vad_analyzer=SileroVADAnalyzer(),
             serializer=serializer,
+            audio_in_filter=KrispFilter(model_path="krisp_sdk_model/models/inb.bvc.hs.c6.w.s.23cdb3.kef", suppression_level=90),
         ),
     )
 
     llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
+    statement_llm = GoogleLLMService(
+        name="StatementJudger",
+        api_key=os.getenv("GOOGLE_API_KEY"),
+        model=CLASSIFIER_MODEL,
+        temperature=0.0,
+        system_instruction=classifier_system_instruction,
+    )
 
     stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"), audio_passthrough=True)
-
-    # tts = CartesiaTTSService(
-    #     api_key=os.getenv("CARTESIA_API_KEY"),
-    #     voice_id="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
-    #     push_silence_after_stop=testing,
-    # )
-
-    # tts = WavesHttpTTSService(
-    #     api_key=os.getenv("WAVES_API_KEY"),
-    #     voice_id="deepika",
-    # )
 
     tts = WavesSSETTSService(
         api_key=os.getenv("WAVES_API_KEY"),
@@ -96,7 +111,7 @@ async def run_bot(websocket_client: WebSocket, stream_sid: str, call_sid: str, t
     messages = [
         {
             "role": "system",
-            "content": "You are an elementary teacher in an audio call. Your output will be converted to audio so don't include special characters in your answers. Respond to what the student said in a short short sentence.",
+            "content": "You are a bank assistant. Your output will be converted to audio so don't include special characters in your answers.",
         },
     ]
 
@@ -106,17 +121,70 @@ async def run_bot(websocket_client: WebSocket, stream_sid: str, call_sid: str, t
     # NOTE: Watch out! This will save all the conversation in memory. You can
     # pass `buffer_size` to get periodic callbacks.
     audiobuffer = AudioBufferProcessor(user_continuous_stream=not testing)
+    
+    notifier = EventNotifier()
+    audio_accumulator = AudioAccumulator()
+    statement_judge_context_filter = StatementJudgeContextFilter(notifier=notifier)
+    completeness_check = CompletenessCheck(notifier=notifier, audio_accumulator=audio_accumulator)
+    bot_output_gate = OutputGate(notifier=notifier, start_open=True)
+    
+    async def user_idle_notifier(frame):
+        await notifier.notify()
+        
+    user_idle = UserIdleProcessor(callback=user_idle_notifier, timeout=10.0)
 
+    async def block_user_stopped_speaking(frame):
+        return not isinstance(frame, UserStoppedSpeakingFrame)
+    
+    async def pass_only_llm_trigger_frames(frame: Frame):
+        return (
+            isinstance(frame, OpenAILLMContextFrame)
+            or isinstance(frame, LLMMessagesFrame)
+            or isinstance(frame, StartInterruptionFrame)
+            or isinstance(frame, StopInterruptionFrame)
+            or isinstance(frame, FunctionCallInProgressFrame)
+            or isinstance(frame, FunctionCallResultFrame)
+        )
+
+    # pipeline = Pipeline(
+    #     [
+    #         transport.input(),  # Websocket input from client
+    #         stt,  # Speech-To-Text
+    #         context_aggregator.user(),
+    #         llm,  # LLM
+    #         tts,  # Text-To-Speech
+    #         transport.output(),  # Websocket output to client
+    #         audiobuffer,  # Used to buffer the audio in the pipeline
+    #         context_aggregator.assistant(),
+    #     ]
+    # )
     pipeline = Pipeline(
         [
             transport.input(),  # Websocket input from client
             stt,  # Speech-To-Text
-            context_aggregator.user(),
-            llm,  # LLM
-            tts,  # Text-To-Speech
+            context_aggregator.user(), # Aggregates user input into context
+            ParallelPipeline(
+                [
+                    # Branch 1: Main flow continuation (blocks original UserStoppedSpeaking)
+                    FunctionFilter(filter=block_user_stopped_speaking),
+                ],
+                [
+                    # Branch 2: Statement LLM for end-of-turn detection
+                    statement_judge_context_filter, # Prepares input for statement_llm
+                    statement_llm,                  # Google LLM for "YES"/"NO"
+                    completeness_check,             # Processes "YES"/"NO", may output UserStoppedSpeakingFrame
+                ],
+                [
+                    # Branch 3: Main conversational LLM and TTS (gated)
+                    FunctionFilter(filter=pass_only_llm_trigger_frames), # Ensure only relevant frames go to main LLM
+                    llm,                            # Main LLM (OpenAI)
+                    bot_output_gate,                # Gates the output of the main LLM
+                ],
+            ),
+            tts,  # Text-To-Speech (receives from gated main LLM)
             transport.output(),  # Websocket output to client
             audiobuffer,  # Used to buffer the audio in the pipeline
-            context_aggregator.assistant(),
+            context_aggregator.assistant(), # Aggregates assistant responses into context
         ]
     )
 
