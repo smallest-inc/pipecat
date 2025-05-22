@@ -6,6 +6,7 @@
 
 import datetime
 import io
+import json
 import os
 import sys
 import wave
@@ -16,6 +17,16 @@ from fastapi import WebSocket
 from loguru import logger
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.frames.frames import (
+    Frame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    LLMMessagesFrame,
+    LLMTextFrame,
+    LLMUpdateSettingsFrame,
+    TTSSpeakFrame,
+)
+from pipecat.observers.turn_tracking_observer import TurnTrackingObserver
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.audio.filters.krisp_filter import KrispFilter
@@ -25,9 +36,17 @@ from pipecat.processors.filters.function_filter import FunctionFilter
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext, OpenAILLMContextFrame
 from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
 from pipecat.serializers.twilio import TwilioFrameSerializer
+from pipecat.services.atoms.atoms_agent import (
+    AtomsAgentContext,
+    CallData,
+    initialize_conversational_agent,
+)
+from pipecat.services.atoms.manager import AgentActionProcessor
+from pipecat.services.atoms.prompts import FT_RESPONSE_MODEL_SYSTEM_PROMPT
+from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
-from pipecat.services.waves.tts import WavesSSETTSService
+from pipecat.services.waves.tts import WavesHttpTTSService, WavesSSETTSService
 from pipecat.transports.network.fastapi_websocket import (
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
@@ -101,22 +120,63 @@ async def run_bot(websocket_client: WebSocket, stream_sid: str, call_sid: str, t
         system_instruction=classifier_system_instruction,
     )
 
-    stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"), audio_passthrough=True)
-
-    tts = WavesSSETTSService(
-        api_key=os.getenv("WAVES_API_KEY"),
-        voice_id="nyah",
+    stt = DeepgramSTTService(
+        api_key=os.getenv("DEEPGRAM_API_KEY"),
+        audio_passthrough=True,
     )
+
+
+    # tts = CartesiaTTSService(
+    #     api_key=os.getenv("CARTESIA_API_KEY"),
+    #     voice_id="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
+    #     push_silence_after_stop=testing,
+    # )
+
+    tts = WavesHttpTTSService(
+        api_key=os.getenv("WAVES_API_KEY"),
+        voice_id="deepika",
+    )
+
+    # tts = WavesSSETTSService(
+    #     api_key=os.getenv("WAVES_API_KEY"),
+    #     voice_id="nyah",
+    # )
+
+    agent_flow_processor = await initialize_conversational_agent(
+        agent_id="680c74afa49c52c0f832821d",
+        call_id="CALL-1746008459293-112543",
+        call_data=CallData(
+            variables={
+                "call_id": "CALL-1747224604782-94a54d",
+                "user_number": "+918815141212",
+                "agent_number": "+918815141212",
+            }
+        ),
+    )
+
+    turn_tracking_observer = TurnTrackingObserver()
+    agent_action_processor = AgentActionProcessor(turn_tracking_observer=turn_tracking_observer)
 
     messages = [
         {
             "role": "system",
-            "content": "You are a bank assistant. Your output will be converted to audio so don't include special characters in your answers.",
+            "content": FT_RESPONSE_MODEL_SYSTEM_PROMPT,
+        },
+        {
+            "role": "user",
+            "content": "",
         },
     ]
 
     context = OpenAILLMContext(messages)
     context_aggregator = llm.create_context_aggregator(context)
+    initial_context = AtomsAgentContext.upgrade_to_atoms_agent(context)
+    chunks = [
+        chunk async for chunk in (await agent_flow_processor.get_response(context=initial_context))
+    ]
+    initial_agent_response = "".join(chunks)
+
+    logger.info(f"Initial agent response: {initial_agent_response}")
 
     # NOTE: Watch out! This will save all the conversation in memory. You can
     # pass `buffer_size` to get periodic callbacks.
@@ -182,7 +242,11 @@ async def run_bot(websocket_client: WebSocket, stream_sid: str, call_sid: str, t
                 ],
             ),
             tts,  # Text-To-Speech (receives from gated main LLM)
+            user_idle,
             transport.output(),  # Websocket output to client
+            context_aggregator.user(),
+            agent_flow_processor,
+            agent_action_processor,
             audiobuffer,  # Used to buffer the audio in the pipeline
             context_aggregator.assistant(), # Aggregates assistant responses into context
         ]
@@ -190,6 +254,8 @@ async def run_bot(websocket_client: WebSocket, stream_sid: str, call_sid: str, t
 
     task = PipelineTask(
         pipeline,
+        observers=[turn_tracking_observer],
+        enable_turn_tracking=False,
         params=PipelineParams(
             audio_in_sample_rate=8000,
             audio_out_sample_rate=8000,
@@ -202,8 +268,8 @@ async def run_bot(websocket_client: WebSocket, stream_sid: str, call_sid: str, t
         # Start recording.
         await audiobuffer.start_recording()
         # Kick off the conversation.
-        messages.append({"role": "system", "content": "Please introduce yourself to the user."})
-        await task.queue_frames([context_aggregator.user().get_context_frame()])
+        # await task.queue_frames([context_aggregator.user().get_context_frame()])
+        await task.queue_frames([TTSSpeakFrame(text=initial_agent_response)])
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
