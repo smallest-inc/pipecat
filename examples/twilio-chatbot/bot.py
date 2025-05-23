@@ -52,6 +52,7 @@ from pipecat.processors.aggregators.openai_llm_context import (
 from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
 from pipecat.processors.filters.function_filter import FunctionFilter
 from pipecat.processors.user_idle_processor import UserIdleProcessor
+from pipecat.serializers.plivo import PlivoFrameSerializer
 from pipecat.serializers.twilio import TwilioFrameSerializer
 from pipecat.services.atoms.atoms_agent import (
     AtomsAgentContext,
@@ -103,6 +104,13 @@ async def run_bot(websocket_client: WebSocket, stream_sid: str, call_sid: str, t
         auth_token=os.getenv("TWILIO_AUTH_TOKEN", ""),
     )
 
+    plivo_serializer = PlivoFrameSerializer(
+        stream_sid=stream_sid,
+        call_sid=call_sid,
+        auth_id=os.getenv("PLIVO_AUTH_ID", ""),
+        auth_token=os.getenv("PLIVO_AUTH_TOKEN", ""),
+    )
+
     transport = FastAPIWebsocketTransport(
         websocket=websocket_client,
         params=FastAPIWebsocketParams(
@@ -110,13 +118,7 @@ async def run_bot(websocket_client: WebSocket, stream_sid: str, call_sid: str, t
             audio_out_enabled=True,
             add_wav_header=False,
             vad_analyzer=SileroVADAnalyzer(),
-            serializer=serializer,
-            audio_in_filter=KrispFilter(
-                model_path=os.path.join(
-                    os.path.dirname(__file__), "krisp_sdk_model/models/inb.bvc.hs.c6.w.s.23cdb3.kef"
-                ),
-                suppression_level=90,
-            ),
+            serializer=plivo_serializer,
         ),
     )
 
@@ -145,19 +147,21 @@ async def run_bot(websocket_client: WebSocket, stream_sid: str, call_sid: str, t
         voice_id="deepika",
     )
 
-    # tts = WavesSSETTSService(
-    #     api_key=os.getenv("WAVES_API_KEY"),
-    #     voice_id="nyah",
-    # )
+    cartesia_tts_service = CartesiaTTSService(
+        api_key=os.getenv("CARTESIA_API_KEY"),
+        voice_id="f91ab3e6-5071-4e15-b016-cde6f2bcd222",  # British Reading Lady
+        model="sonic-turbo",
+        push_silence_after_stop=True,
+    )
 
     agent_flow_processor = await initialize_conversational_agent(
-        agent_id="680c74afa49c52c0f832821d",
-        call_id="CALL-1746008459293-112543",
+        agent_id="682f03863b5d08dca8ffe81b",
+        call_id="CALL-1744825557128-ef7f19",
         call_data=CallData(
             variables={
-                "call_id": "CALL-1747224604782-94a54d",
-                "user_number": "+918815141212",
-                "agent_number": "+918815141212",
+                "call_id": "CALL-1744825557128-ef7f19",
+                "user_number": "+918168875163",
+                "agent_number": "+918168875163",
             }
         ),
     )
