@@ -1442,7 +1442,7 @@ async def get_conv_pathway_graph(agent_id, call_id) -> tuple[str, dict]:
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(
-                f"http://localhost:4001/api/v1/admin/get-agent-details",
+                f"{os.getenv('ATOMS_API_ENDPOINT')}/api/v1/admin/get-agent-details",
                 headers=headers,
                 params=params,
             )
